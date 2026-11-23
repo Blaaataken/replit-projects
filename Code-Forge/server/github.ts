@@ -1,0 +1,101 @@
+import { Octokit } from '@octokit/rest';
+import type { FileNode } from "@shared/schema";
+
+let connectionSettings: any;
+
+async function getAccessToken() {
+  if (connectionSettings && connectionSettings.settings.expires_at && new Date(connectionSettings.settings.expires_at).getTime() > Date.now()) {
+    return connectionSettings.settings.access_token;
+  }
+  
+  const hostname = process.env.REPLIT_CONNECTORS_HOSTNAME;
+  const xReplitToken = process.env.REPL_IDENTITY 
+    ? 'repl ' + process.env.REPL_IDENTITY 
+    : process.env.WEB_REPL_RENEWAL 
+    ? 'depl ' + process.env.WEB_REPL_RENEWAL 
+    : null;
+
+  if (!xReplitToken) {
+    throw new Error('X_REPLIT_TOKEN not found for repl/depl');
+  }
+
+  connectionSettings = await fetch(
+    'https://' + hostname + '/api/v2/connection?include_secrets=true&connector_names=github',
+    {
+      headers: {
+        'Accept': 'application/json',
+        'X_REPLIT_TOKEN': xReplitToken
+      }
+    }
+  ).then(res => res.json()).then(data => data.items?.[0]);
+
+  const accessToken = connectionSettings?.settings?.access_token || connectionSettings.settings?.oauth?.credentials?.access_token;
+
+  if (!connectionSettings || !accessToken) {
+    throw new Error('GitHub not connected');
+  }
+  return accessToken;
+}
+
+// WARNING: Never cache this client.
+// Access tokens expire, so a new client must be created each time.
+export async function getUncachableGitHubClient() {
+  const accessToken = await getAccessToken();
+  return new Octokit({ auth: accessToken });
+}
+
+// Get authenticated user info
+export async function getGitHubUser() {
+  const octokit = await getUncachableGitHubClient();
+  const { data } = await octokit.users.getAuthenticated();
+  return data;
+}
+
+// Create a new repository with files
+export async function createRepository(
+  name: string, 
+  description: string, 
+  files: FileNode[], 
+  isPrivate: boolean = false
+) {
+  const octokit = await getUncachableGitHubClient();
+  const user = await getGitHubUser();
+  
+  // Create the repository
+  const { data: repo } = await octokit.repos.createForAuthenticatedUser({
+    name,
+    description,
+    private: isPrivate,
+    auto_init: false,
+  });
+
+  // Create files in the repository
+  await createFilesInRepo(octokit, user.login, name, files);
+
+  return repo;
+}
+
+// Recursively create files in the repository
+async function createFilesInRepo(
+  octokit: Octokit, 
+  owner: string, 
+  repo: string, 
+  files: FileNode[], 
+  basePath: string = ""
+) {
+  for (const file of files) {
+    const path = basePath ? `${basePath}/${file.name}` : file.name;
+    
+    if (file.type === "file" && file.content) {
+      await octokit.repos.createOrUpdateFileContents({
+        owner,
+        repo,
+        path,
+        message: `Add ${path}`,
+        content: Buffer.from(file.content).toString('base64'),
+      });
+    } else if (file.type === "folder" && file.children) {
+      await createFilesInRepo(octokit, owner, repo, file.children, path);
+    }
+  }
+}
